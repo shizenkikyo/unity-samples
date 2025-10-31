@@ -1,0 +1,8 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements" xmlns:uie="UnityEditor.UIElements">
+	<ui:VisualElement name="Root" class="root">
+		<ui:Label name="TopMessage" class="top-message" text="" />
+		<ui:VisualElement name="CirclesContainer" class="circles" />
+	</ui:VisualElement>
+</ui:UXML>
+
+
