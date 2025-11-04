@@ -1,5 +1,7 @@
-using System.Collections;
+using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using MemorySwipeGame.Application;
 using MemorySwipeGame.Domain;
 using MemorySwipeGame.Infrastructure;
@@ -37,8 +39,8 @@ namespace MemorySwipeGame
 		private bool isDragging;
 		private Vector2 dragStartScreen;
 
-		private Coroutine revealRoutine;
-		private Coroutine nextRoundRoutine;
+		private CancellationTokenSource revealCts;
+		private CancellationTokenSource nextRoundCts;
 
 		private void Awake()
 		{
@@ -133,9 +135,8 @@ namespace MemorySwipeGame
 
 		private void StartNewGame()
 		{
-			StopAllCoroutines();
-			revealRoutine = null;
-			nextRoundRoutine = null;
+			CancelRevealTask();
+			CancelNextRoundTask();
 
 			visibleSequence.Clear();
 			recallCursor = 0;
@@ -152,17 +153,8 @@ namespace MemorySwipeGame
 		{
 			if (isGameOver) return;
 
-			if (revealRoutine != null)
-			{
-				StopCoroutine(revealRoutine);
-				revealRoutine = null;
-			}
-
-			if (nextRoundRoutine != null)
-			{
-				StopCoroutine(nextRoundRoutine);
-				nextRoundRoutine = null;
-			}
+			CancelRevealTask();
+			CancelNextRoundTask();
 
 			isInputLocked = true;
 			useCase.PrepareNextRound();
@@ -281,16 +273,16 @@ namespace MemorySwipeGame
 		{
 			if (index < 0 || index >= cursorInstances.Count) return;
 
-			if (revealRoutine != null)
-			{
-				StopCoroutine(revealRoutine);
-			}
+			CancelRevealTask();
 
-			revealRoutine = StartCoroutine(RevealNewestCursorRoutine(index));
+			var cts = new CancellationTokenSource();
+			revealCts = cts;
+			_ = RevealNewestCursorAsync(index, cts);
 		}
 
-		private IEnumerator RevealNewestCursorRoutine(int index)
+		private async Task RevealNewestCursorAsync(int index, CancellationTokenSource cts)
 		{
+			var token = cts.Token;
 			isInputLocked = true;
 
 			RawImageArrowController controller = GetArrowController(index);
@@ -300,14 +292,29 @@ namespace MemorySwipeGame
 				Debug.Log($"Circle #{index + 1} 方向: {visibleSequence[index]}");
 			}
 
-			yield return new WaitForSeconds(revealSeconds);
+			try
+			{
+				var delaySeconds = Mathf.Max(0f, revealSeconds);
+				if (delaySeconds > 0f)
+				{
+					await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+				}
+			}
+			catch (TaskCanceledException)
+			{
+				if (controller != null)
+				{
+					controller.SetVisible(false);
+				}
+				return;
+			}
 
 			if (controller != null)
 			{
 				controller.SetVisible(false);
 			}
 
-			revealRoutine = null;
+			ClearRevealTaskReference(cts);
 			useCase.BeginRecallPhase();
 		}
 
@@ -328,13 +335,6 @@ namespace MemorySwipeGame
 			if (cursor == null) return null;
 
 			return cursor.GetComponent<RawImageArrowController>();
-		}
-
-		private IEnumerator PrepareNextRoundAfterDelay()
-		{
-			yield return new WaitForSeconds(nextRoundDelaySeconds);
-			nextRoundRoutine = null;
-			PrepareNextRound();
 		}
 
 		public void PresentGameReset()
@@ -383,12 +383,7 @@ namespace MemorySwipeGame
 				ShowCursorAsRecalled(sequenceLength - 1);
 			}
 
-			if (nextRoundRoutine != null)
-			{
-				StopCoroutine(nextRoundRoutine);
-			}
-
-			nextRoundRoutine = StartCoroutine(PrepareNextRoundAfterDelay());
+			ScheduleNextRound();
 		}
 
 		public void PresentIncorrectInput(ArrowDirection expected, ArrowDirection received, int progress, int sequenceLength)
@@ -400,6 +395,7 @@ namespace MemorySwipeGame
 		{
 			isGameOver = true;
 			isInputLocked = true;
+			CancelNextRoundTask();
 		}
 
 		private void OnGUI()
@@ -415,7 +411,7 @@ namespace MemorySwipeGame
 			{
 				GUI.Label(r, "Game Over - Tap/Click to Retry", style);
 			}
-			else if (isInputLocked && revealRoutine != null)
+			else if (isInputLocked && revealCts != null)
 			{
 				GUI.Label(r, "Memorize the arrow...", style);
 			}
@@ -431,7 +427,81 @@ namespace MemorySwipeGame
 
 			GUI.Label(new Rect(0, 44, Screen.width, 30),
 				$"Length: {visibleSequence.Count}  Progress: {recallCursor}/{visibleSequence.Count}",
-				sub);
+					sub);
+		}
+
+		private void CancelRevealTask()
+		{
+			if (revealCts != null)
+			{
+				var cts = revealCts;
+				revealCts = null;
+				cts.Cancel();
+				cts.Dispose();
+			}
+		}
+
+		private void CancelNextRoundTask()
+		{
+			if (nextRoundCts != null)
+			{
+				var cts = nextRoundCts;
+				nextRoundCts = null;
+				cts.Cancel();
+				cts.Dispose();
+			}
+		}
+
+		private void ClearRevealTaskReference(CancellationTokenSource cts)
+		{
+			if (ReferenceEquals(revealCts, cts))
+			{
+				revealCts = null;
+			}
+			cts.Dispose();
+		}
+
+		private void ScheduleNextRound()
+		{
+			CancelNextRoundTask();
+
+			var cts = new CancellationTokenSource();
+			nextRoundCts = cts;
+			_ = PrepareNextRoundAfterDelayAsync(cts);
+		}
+
+		private async Task PrepareNextRoundAfterDelayAsync(CancellationTokenSource cts)
+		{
+			var token = cts.Token;
+			try
+			{
+				var delaySeconds = Mathf.Max(0f, nextRoundDelaySeconds);
+				if (delaySeconds > 0f)
+				{
+					await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
+				}
+				if (token.IsCancellationRequested)
+				{
+					return;
+				}
+			}
+			catch (TaskCanceledException)
+			{
+				return;
+			}
+			finally
+			{
+				if (ReferenceEquals(nextRoundCts, cts))
+				{
+					nextRoundCts = null;
+				}
+				cts.Dispose();
+			}
+
+			if (!isGameOver)
+			{
+				PrepareNextRound();
+			}
 		}
 	}
 }
