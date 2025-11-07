@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using MemorySwipeGame.Application;
 using MemorySwipeGame.Domain;
 using MemorySwipeGame.Infrastructure;
+using TMPro;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -21,11 +22,15 @@ namespace MemorySwipeGame
 		[SerializeField] private int maxSequence = 50;
 		[SerializeField] private float historyRowYOffset = -220f;
 		[SerializeField, Range(0.1f, 1f)] private float historyScale = 0.5f;
+		[SerializeField] private float historyRowLineSpacing = -140f;
+		[SerializeField] private float historyRowHorizontalPadding = 80f;
+		[SerializeField] private float historyItemExtraGap = 10f;
 
 		[Header("Gameplay")]
-		[SerializeField] private float revealSeconds = 3f;
 		[SerializeField] private float inputDeadZonePixels = 40f;
 		[SerializeField] private float nextRoundDelaySeconds = 0.75f;
+		[SerializeField] private TMP_Text countdownText;
+		[SerializeField] private float countdownIntervalSeconds = 0.5f;
 
 		private readonly List<ArrowDirection> visibleSequence = new List<ArrowDirection>();
 		private readonly List<GameObject> cursorInstances = new List<GameObject>();
@@ -42,11 +47,17 @@ namespace MemorySwipeGame
 		private CancellationTokenSource revealCts;
 		private CancellationTokenSource nextRoundCts;
 
+		private bool debugShowAllCursors;
+#if UNITY_EDITOR
+		private ArrowDirection lastSwipeDirection = ArrowDirection.None;
+#endif
+
 		private void Awake()
 		{
 			randomDirectionProvider = new UnityRandomDirectionProvider();
 			useCase = new MemorySwipeGameUseCase(maxSequence, randomDirectionProvider);
 			useCase.SetPresenter(this);
+			HideCountdown();
 		}
 
 		private void Start()
@@ -122,6 +133,10 @@ namespace MemorySwipeGame
 			ArrowDirection dir = SwipeUtils.GetDirectionFromDelta(delta, inputDeadZonePixels);
 			if (dir == ArrowDirection.None) return;
 
+#if UNITY_EDITOR
+			lastSwipeDirection = dir;
+#endif
+
 			SequenceEvaluation evaluation = useCase.SubmitInput(dir);
 			if (evaluation.State == SequenceEvaluationState.Ignored)
 			{
@@ -143,6 +158,7 @@ namespace MemorySwipeGame
 			isGameOver = false;
 			isInputLocked = false;
 			isDragging = false;
+			HideCountdown();
 
 			EnsureCursorCount(0);
 			useCase.ResetGame();
@@ -204,6 +220,13 @@ namespace MemorySwipeGame
 				return;
 			}
 
+			RectTransform canvasRect = canvas.GetComponent<RectTransform>();
+			float canvasWidth = canvasRect != null ? canvasRect.rect.width : Screen.width;
+			float historySpacing = Mathf.Max(10f, circleSpacing * 0.5f + historyItemExtraGap);
+			float availableWidth = Mathf.Max(historySpacing, canvasWidth - historyRowHorizontalPadding * 2f);
+			int maxPerRow = Mathf.Max(1, Mathf.FloorToInt(availableWidth / historySpacing));
+			int historyCount = Mathf.Max(0, n - 1);
+
 			for (int i = 0; i < n; i++)
 			{
 				GameObject cursor = cursorInstances[i];
@@ -225,24 +248,24 @@ namespace MemorySwipeGame
 				}
 				else
 				{
-					int historyCount = n - 1;
-					int historyIndex = i;
-					float offsetFromCenter;
-					if (historyCount == 1)
+					if (historyCount == 0)
 					{
-						offsetFromCenter = 0f;
-					}
-					else if (historyCount % 2 == 1)
-					{
-						int centerIndex = historyCount / 2;
-						offsetFromCenter = (historyIndex - centerIndex) * circleSpacing;
+						rt.anchoredPosition = new Vector2(centerOffset.x, centerOffset.y + historyRowYOffset);
 					}
 					else
 					{
-						offsetFromCenter = (historyIndex - (historyCount - 1) * 0.5f) * circleSpacing;
+						int historyIndex = i;
+						int row = historyIndex / maxPerRow;
+						int rowStartIndex = row * maxPerRow;
+						int itemsThisRow = Mathf.Min(maxPerRow, historyCount - rowStartIndex);
+						int indexInRow = historyIndex % maxPerRow;
+						float rowWidth = (itemsThisRow - 1) * historySpacing;
+						float startX = -rowWidth * 0.5f;
+						float offsetX = startX + indexInRow * historySpacing;
+						float offsetY = historyRowYOffset + row * historyRowLineSpacing;
+						rt.anchoredPosition = new Vector2(centerOffset.x + offsetX, centerOffset.y + offsetY);
 					}
 
-					rt.anchoredPosition = new Vector2(centerOffset.x + offsetFromCenter, centerOffset.y + historyRowYOffset);
 					rt.localScale = Vector3.one * Mathf.Clamp(historyScale, 0.1f, 1f);
 				}
 
@@ -251,7 +274,7 @@ namespace MemorySwipeGame
 					RawImageArrowController arrowCtrl = cursor.GetComponent<RawImageArrowController>();
 					if (arrowCtrl != null)
 					{
-						arrowCtrl.SetVisible(false);
+						SetCursorVisibility(arrowCtrl, false);
 					}
 				}
 			}
@@ -265,7 +288,8 @@ namespace MemorySwipeGame
 				if (controller == null) continue;
 
 				controller.SetDirection(visibleSequence[i]);
-				controller.SetVisible(false);
+				bool shouldBeVisible = debugShowAllCursors;
+				SetCursorVisibility(controller, shouldBeVisible);
 			}
 		}
 
@@ -286,32 +310,24 @@ namespace MemorySwipeGame
 			isInputLocked = true;
 
 			RawImageArrowController controller = GetArrowController(index);
+			SetCursorVisibility(controller, true);
 			if (controller != null)
 			{
-				controller.SetVisible(true);
 				Debug.Log($"Circle #{index + 1} 方向: {visibleSequence[index]}");
 			}
 
 			try
 			{
-				var delaySeconds = Mathf.Max(0f, revealSeconds);
-				if (delaySeconds > 0f)
+				await PlayCountdownAsync(token, () =>
 				{
-					await Task.Delay(TimeSpan.FromSeconds(delaySeconds), token);
-				}
+					SetCursorVisibility(controller, false);
+				});
 			}
 			catch (TaskCanceledException)
 			{
-				if (controller != null)
-				{
-					controller.SetVisible(false);
-				}
+				SetCursorVisibility(controller, false);
+				ClearRevealTaskReference(cts);
 				return;
-			}
-
-			if (controller != null)
-			{
-				controller.SetVisible(false);
 			}
 
 			ClearRevealTaskReference(cts);
@@ -321,10 +337,7 @@ namespace MemorySwipeGame
 		private void ShowCursorAsRecalled(int index)
 		{
 			RawImageArrowController controller = GetArrowController(index);
-			if (controller != null)
-			{
-				controller.SetVisible(true);
-			}
+			SetCursorVisibility(controller, true);
 		}
 
 		private RawImageArrowController GetArrowController(int index)
@@ -395,18 +408,30 @@ namespace MemorySwipeGame
 		{
 			isGameOver = true;
 			isInputLocked = true;
+			CancelRevealTask();
 			CancelNextRoundTask();
+			ShowAllCursors();
 		}
 
 		private void OnGUI()
 		{
+			const float debugButtonWidth = 120f;
+			const float debugButtonHeight = 34f;
+			Rect debugRect = new Rect(10f, 10f, debugButtonWidth, debugButtonHeight);
+			string debugLabel = $"Debug: {(debugShowAllCursors ? "On" : "Off")}";
+			if (GUI.Button(debugRect, debugLabel))
+			{
+				ToggleDebugCursors();
+			}
+
 			var style = new GUIStyle(GUI.skin.label)
 			{
 				alignment = TextAnchor.UpperCenter,
 				fontSize = 24
 			};
 
-			Rect r = new Rect(0, 10, Screen.width, 40);
+			float labelTop = 60f;
+			Rect r = new Rect(0, labelTop, Screen.width, 40);
 			if (isGameOver)
 			{
 				GUI.Label(r, "Game Over - Tap/Click to Retry", style);
@@ -425,9 +450,15 @@ namespace MemorySwipeGame
 				fontSize = 16
 			};
 
-			GUI.Label(new Rect(0, 44, Screen.width, 30),
-				$"Length: {visibleSequence.Count}  Progress: {recallCursor}/{visibleSequence.Count}",
-					sub);
+			GUI.Label(new Rect(0, labelTop + 34f, Screen.width, 30),
+					$"Length: {visibleSequence.Count}  Progress: {recallCursor}/{visibleSequence.Count}",
+						sub);
+
+#if UNITY_EDITOR
+			GUI.Label(new Rect(0, labelTop + 60f, Screen.width, 20),
+				$"[Debug] Last Swipe: {lastSwipeDirection}",
+				sub);
+#endif
 		}
 
 		private void CancelRevealTask()
@@ -468,6 +499,113 @@ namespace MemorySwipeGame
 			var cts = new CancellationTokenSource();
 			nextRoundCts = cts;
 			_ = PrepareNextRoundAfterDelayAsync(cts);
+		}
+
+		private void ShowAllCursors()
+		{
+			for (int i = 0; i < cursorInstances.Count; i++)
+			{
+				RawImageArrowController controller = GetArrowController(i);
+				SetCursorVisibility(controller, true);
+			}
+		}
+
+		private void SetCursorVisibility(RawImageArrowController controller, bool visible)
+		{
+			if (controller == null) return;
+
+			if (visible)
+			{
+				controller.SetVisible(true);
+			}
+			else if (!debugShowAllCursors)
+			{
+				controller.SetVisible(false);
+			}
+		}
+
+		private void ToggleDebugCursors()
+		{
+			debugShowAllCursors = !debugShowAllCursors;
+			if (debugShowAllCursors)
+			{
+				ShowAllCursors();
+			}
+			else
+			{
+				RefreshCursorVisibility();
+			}
+		}
+
+		private void RefreshCursorVisibility()
+		{
+			if (isGameOver)
+			{
+				ShowAllCursors();
+				return;
+			}
+
+			ApplySequenceToCursors();
+
+			for (int i = 0; i < recallCursor; i++)
+			{
+				ShowCursorAsRecalled(i);
+			}
+
+			if (revealCts != null && visibleSequence.Count > 0)
+			{
+				int newestIndex = visibleSequence.Count - 1;
+				RawImageArrowController controller = GetArrowController(newestIndex);
+				SetCursorVisibility(controller, true);
+			}
+		}
+
+		private async Task PlayCountdownAsync(CancellationToken token, Action onGo = null)
+		{
+			if (countdownText == null)
+			{
+				onGo?.Invoke();
+				return;
+			}
+
+			string[] steps = { "3", "2", "1", "GO!" };
+			float interval = Mathf.Max(0.05f, countdownIntervalSeconds);
+
+			countdownText.gameObject.SetActive(true);
+
+			const bool holdFinalStep = true;
+
+			try
+			{
+				for (int i = 0; i < steps.Length; i++)
+				{
+					string step = steps[i];
+					countdownText.text = step;
+
+					if (step == "GO!")
+					{
+						onGo?.Invoke();
+					}
+
+					bool isLastStep = (i == steps.Length - 1);
+					if (!isLastStep || holdFinalStep)
+					{
+						await Task.Delay(TimeSpan.FromSeconds(interval), token);
+					}
+				}
+			}
+			finally
+			{
+				HideCountdown();
+			}
+		}
+
+		private void HideCountdown()
+		{
+			if (countdownText != null)
+			{
+				countdownText.gameObject.SetActive(false);
+			}
 		}
 
 		private async Task PrepareNextRoundAfterDelayAsync(CancellationTokenSource cts)
